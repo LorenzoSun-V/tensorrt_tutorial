@@ -16,3 +16,5 @@ lib/
 src/*/build/
 src/*/res/*.onnx
 src/*/res/*.trtmodel
+src/*/res/*.pt
+src/*/res/*.pth
