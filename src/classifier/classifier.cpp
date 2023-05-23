@@ -104,7 +104,7 @@ bool build_model(){
 
     TRTLogger logger;
 
-    // 这是基本需要的组件
+    // 这是基本需要的组件，这里createInferBuilder返回的指针传给make_nvshared，主要是为了让指针自动释放
     auto builder = make_nvshared(nvinfer1::createInferBuilder(logger));
     auto config = make_nvshared(builder->createBuilderConfig());
     auto network = make_nvshared(builder->createNetworkV2(1));
@@ -224,8 +224,11 @@ void inference(){
 
     // 对应于pytorch的代码部分
     cv::resize(image, image, cv::Size(input_width, input_height));
+    // BGR -> RGB
+    // (pixel / 255.0 - mean) / std
+    // to tensor -> BGRBGRBGR -> BBBGGGRRR
     int image_area = image.cols * image.rows;
-    unsigned char* pimage = image.data;
+    unsigned char* pimage = image.data;  // BGRBGRBGR, input_data_host->BBBGGGRRR
     float* phost_b = input_data_host + image_area * 0;
     float* phost_g = input_data_host + image_area * 1;
     float* phost_r = input_data_host + image_area * 2;
