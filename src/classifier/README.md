@@ -8,6 +8,7 @@
 cd src/classifier
 python gen-onnx.py -r resnet18
 ```
+
     Tips: 默认是resnet18模型。
 
 ## Step 3. 编译
