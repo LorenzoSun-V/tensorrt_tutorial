@@ -50,16 +50,10 @@ inline const char* severity_string(nvinfer1::ILogger::Severity t){
     }
 }
 
-static vector<int> _classes_colors = {
-    0, 0, 0, 128, 0, 0, 0, 128, 0, 128, 128, 0, 0, 0, 128, 128, 0, 128, 0, 128, 128, 
-    128, 128, 128, 64, 0, 0, 192, 0, 0, 64, 128, 0, 192, 128, 0, 64, 0, 128, 192, 0, 128, 
-    64, 128, 128, 192, 128, 128, 0, 64, 0, 128, 64, 0, 0, 192, 0, 128, 192, 0, 0, 64, 128, 128, 64, 12
-};
-
 class TRTLogger : public nvinfer1::ILogger{
 public:
     virtual void log(Severity severity, nvinfer1::AsciiChar const* msg) noexcept override{
-        if(severity <= Severity::kWARNING){
+        if(severity <= Severity::kINFO){
             // 打印带颜色的字符，格式如下：
             // printf("\033[47;33m打印的文本\033[0m");
             // 其中 \033[ 是起始标记
@@ -102,8 +96,8 @@ bool exists(const string& path){
 // 上一节的代码
 bool build_model(){
 
-    if(exists("unet.trtmodel")){
-        printf("unet.trtmodel has exists.\n");
+    if(exists("engine.trtmodel")){
+        printf("Engine.trtmodel has exists.\n");
         return true;
     }
 
@@ -119,14 +113,14 @@ bool build_model(){
 
     // 通过onnxparser解析器解析的结果会填充到network中，类似addConv的方式添加进去
     auto parser = make_nvshared(nvonnxparser::createParser(*network, logger));
-    if(!parser->parseFromFile("unet.onnx", 1)){
-        printf("Failed to parse unet.onnx\n");
+    if(!parser->parseFromFile("alpha-pose-136.onnx", 1)){
+        printf("Failed to parse alpha-pose-136.onnx\n");
 
         // 注意这里的几个指针还没有释放，是有内存泄漏的，后面考虑更优雅的解决
         return false;
     }
     
-    int maxBatchSize = 10;
+    int maxBatchSize = 2;
     printf("Workspace Size = %.2f MB\n", (1 << 28) / 1024.0f / 1024.0f);
     config->setMaxWorkspaceSize(1 << 28);
 
@@ -154,12 +148,12 @@ bool build_model(){
 
     // 将模型序列化，并储存为文件
     auto model_data = make_nvshared(engine->serialize());
-    FILE* f = fopen("unet.trtmodel", "wb");
+    FILE* f = fopen("engine.trtmodel", "wb");
     fwrite(model_data->data(), 1, model_data->size(), f);
     fclose(f);
 
     // 卸载顺序按照构建顺序倒序
-    printf("Build Done.\n");
+    printf("Done.\n");
     return true;
 }
 
@@ -184,57 +178,36 @@ vector<unsigned char> load_file(const string& file){
     return data;
 }
 
-static tuple<cv::Mat, cv::Mat> post_process(float* output, int output_width, int output_height, int num_class, int ibatch){
-
-    cv::Mat output_prob(output_height, output_width, CV_32F);
-    cv::Mat output_index(output_height, output_width, CV_8U);
-
-    float* pnet   = output + ibatch * output_width * output_height * num_class;
-    float* prob   = output_prob.ptr<float>(0);
-    uint8_t* pidx = output_index.ptr<uint8_t>(0);
-
-    for(int k = 0; k < output_prob.cols * output_prob.rows; ++k, pnet+=num_class, ++prob, ++pidx){
-        int ic = std::max_element(pnet, pnet + num_class) - pnet;
-        *prob  = pnet[ic];
-        *pidx  = ic;
+void get_preprocess_transform(const cv::Size& image_size, const cv::Rect& box, const cv::Size& net_size, float i2d[6], float d2i[6]){
+    cv::Rect box_ = box;
+    if(box_.width == 0 || box_.height == 0){
+        box_.width  = image_size.width;
+        box_.height = image_size.height;
+        box_.x = 0;
+        box_.y = 0;
     }
-    return make_tuple(output_prob, output_index);
-}
 
-static void render(cv::Mat& image, const cv::Mat& prob, const cv::Mat& iclass){
+    float rate = box_.width > 100 ? 0.1f : 0.15f;
+    float pad_width  = box_.width  * (1 + 2 * rate);
+    float pad_height = box_.height * (1 + 1 * rate);
+    float scale = min(net_size.width  / pad_width,  net_size.height / pad_height);
+    i2d[0] = scale;  i2d[1] = 0;      i2d[2] = -(box_.x - box_.width  * 1 * rate + pad_width * 0.5)  * scale + net_size.width  * 0.5 + scale * 0.5 - 0.5;  
+    i2d[3] = 0;      i2d[4] = scale;  i2d[5] = -(box_.y - box_.height * 1 * rate + pad_height * 0.5) * scale + net_size.height * 0.5 + scale * 0.5 - 0.5;
 
-    auto pimage = image.ptr<cv::Vec3b>(0);
-    auto pprob  = prob.ptr<float>(0);
-    auto pclass = iclass.ptr<uint8_t>(0);
-
-    for(int i = 0; i < image.cols*image.rows; ++i, ++pimage, ++pprob, ++pclass){
-
-        int iclass        = *pclass;
-        float probability = *pprob;
-        auto& pixel       = *pimage;
-        float foreground  = min(0.6f + probability * 0.2f, 0.8f);
-        float background  = 1 - foreground;
-        for(int c = 0; c < 3; ++c){
-            auto value = pixel[c] * background + foreground * _classes_colors[iclass * 3 + 2-c];
-            pixel[c] = min((int)value, 255);
-        }
-    }
+    cv::Mat m2x3_i2d(2, 3, CV_32F, i2d);
+    cv::Mat m2x3_d2i(2, 3, CV_32F, d2i);
+    cv::invertAffineTransform(m2x3_i2d, m2x3_d2i);
 }
 
 void inference(){
 
     TRTLogger logger;
-    auto engine_data = load_file("unet.trtmodel");
+    auto engine_data = load_file("engine.trtmodel");
     auto runtime   = make_nvshared(nvinfer1::createInferRuntime(logger));
     auto engine = make_nvshared(runtime->deserializeCudaEngine(engine_data.data(), engine_data.size()));
     if(engine == nullptr){
         printf("Deserialize cuda engine failed.\n");
         runtime->destroy();
-        return;
-    }
-
-    if(engine->getNbBindings() != 2){
-        printf("你的onnx导出有问题，必须是1个输入和1个输出，你这明显有：%d个输出.\n", engine->getNbBindings() - 1);
         return;
     }
 
@@ -244,8 +217,8 @@ void inference(){
 
     int input_batch = 1;
     int input_channel = 3;
-    int input_height = 512;
-    int input_width = 512;
+    int input_height = 256;
+    int input_width = 192;
     int input_numel = input_batch * input_channel * input_height * input_width;
     float* input_data_host = nullptr;
     float* input_data_device = nullptr;
@@ -253,66 +226,64 @@ void inference(){
     checkRuntime(cudaMalloc(&input_data_device, input_numel * sizeof(float)));
 
     ///////////////////////////////////////////////////
-    // letter box
-    auto image = cv::imread("street.jpg");
-    float scale_x = input_width / (float)image.cols;
-    float scale_y = input_height / (float)image.rows;
-    float scale = std::min(scale_x, scale_y);
+    // image to float
+    auto image = cv::imread("girl.jpg");
+    float mean[] = {0.480, 0.457, 0.406};  // BGR
+
+    // 对应于pytorch的代码部分
     float i2d[6], d2i[6];
-    i2d[0] = scale;  i2d[1] = 0;  i2d[2] = (-scale * image.cols + input_width + scale  - 1) * 0.5;
-    i2d[3] = 0;  i2d[4] = scale;  i2d[5] = (-scale * image.rows + input_height + scale - 1) * 0.5;
-
-    cv::Mat m2x3_i2d(2, 3, CV_32F, i2d);
-    cv::Mat m2x3_d2i(2, 3, CV_32F, d2i);
-    cv::invertAffineTransform(m2x3_i2d, m2x3_d2i);
-
-    cv::Mat input_image(input_height, input_width, CV_8UC3);
-    cv::warpAffine(image, input_image, m2x3_i2d, input_image.size(), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(114));
+    auto box = cv::Rect(158, 104, 176, 693);
+    get_preprocess_transform(image.size(), box, cv::Size(input_width, input_height), i2d, d2i);
+    
+    cv::Mat input_image;
+    cv::Mat i2d_mat(2, 3, CV_32F, i2d);
+    cv::warpAffine(image, input_image, i2d_mat, cv::Size(input_width, input_height), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(127));
     cv::imwrite("input-image.jpg", input_image);
 
-    int image_area = input_image.cols * input_image.rows;
+    int image_area = input_width * input_height;
     unsigned char* pimage = input_image.data;
     float* phost_b = input_data_host + image_area * 0;
     float* phost_g = input_data_host + image_area * 1;
     float* phost_r = input_data_host + image_area * 2;
     for(int i = 0; i < image_area; ++i, pimage += 3){
-        *phost_r++ = pimage[0] / 255.0f;
-        *phost_g++ = pimage[1] / 255.0f;
-        *phost_b++ = pimage[2] / 255.0f;
+        // 注意这里的顺序rgb调换了
+        *phost_r++ = (pimage[0] / 255.0f - mean[0]);
+        *phost_g++ = (pimage[1] / 255.0f - mean[1]);
+        *phost_b++ = (pimage[2] / 255.0f - mean[2]);
     }
     ///////////////////////////////////////////////////
     checkRuntime(cudaMemcpyAsync(input_data_device, input_data_host, input_numel * sizeof(float), cudaMemcpyHostToDevice, stream));
 
-    // 3x3输入，对应3x3输出
-    auto output_dims   = engine->getBindingDimensions(1);
-    int output_height  = output_dims.d[1];
-    int output_width   = output_dims.d[2];
-    int num_classes    = output_dims.d[3];
-    int output_numel = input_batch * output_height * output_width * num_classes;
-    float* output_data_host = nullptr;
-    float* output_data_device = nullptr;
-    checkRuntime(cudaMallocHost(&output_data_host, sizeof(float) * output_numel));
-    checkRuntime(cudaMalloc(&output_data_device, sizeof(float) * output_numel));
-
     // 明确当前推理时，使用的数据输入大小
     auto input_dims = engine->getBindingDimensions(0);
     input_dims.d[0] = input_batch;
-
     execution_context->setBindingDimensions(0, input_dims);
+
+    auto output_dims = engine->getBindingDimensions(1);
+    const int num_joint = output_dims.d[1];
+    const int num_keyelm = output_dims.d[2];
+    const int num_output_elm = input_batch * num_joint * num_keyelm;
+    float* output_data_host = nullptr;
+    float* output_data_device = nullptr;
+    checkRuntime(cudaMallocHost(&output_data_host, num_output_elm * sizeof(float)));
+    checkRuntime(cudaMalloc(&output_data_device,   num_output_elm * sizeof(float)));
+
     float* bindings[] = {input_data_device, output_data_device};
     bool success      = execution_context->enqueueV2((void**)bindings, stream, nullptr);
-    checkRuntime(cudaMemcpyAsync(output_data_host, output_data_device, sizeof(float) * output_numel, cudaMemcpyDeviceToHost, stream));
+    checkRuntime(cudaMemcpyAsync(output_data_host, output_data_device, num_output_elm * sizeof(float), cudaMemcpyDeviceToHost, stream));
     checkRuntime(cudaStreamSynchronize(stream));
 
-    // 512 x 512
-    cv::Mat prob, iclass;
-    tie(prob, iclass) = post_process(output_data_host, output_width, output_height, num_classes, 0);
-    // 去灰边
-    cv::warpAffine(prob, prob, m2x3_d2i, image.size(), cv::INTER_LINEAR);
-    cv::warpAffine(iclass, iclass, m2x3_d2i, image.size(), cv::INTER_NEAREST);
-    render(image, prob, iclass);
-
-    printf("Done, Save to image-draw.jpg\n");
+    for(int i = 0; i < num_joint; ++i){
+        float* pkey = output_data_host + i * num_keyelm;
+        float x = pkey[0];
+        float y = pkey[1];
+        float confidence = pkey[2];
+        if(confidence > 0.05){
+            x = x * d2i[0] + d2i[2];
+            y = y * d2i[0] + d2i[5];
+            cv::circle(image, cv::Point(x, y), 2, cv::Scalar(0, 255, 0), -1, 16);
+        }
+    }
     cv::imwrite("image-draw.jpg", image);
 
     checkRuntime(cudaStreamDestroy(stream));
