@@ -2,6 +2,8 @@
 
 ## Step 1. 安装依赖
 
+依赖安装完成后，可直接进入`classifier`目录，执行`run.sh`生成onnx、编译、运行程序。
+
 ## Step 2. 生成onnx文件
 
 ```shell
