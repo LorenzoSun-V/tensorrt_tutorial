@@ -9,6 +9,9 @@
 */*/*.wts
 */*/__pycache__/
 */*/log*
+*/*/*/__pycache__/
+*/*/*/*/__pycache__/
+*/*/*/*/*/__pycache__/
 
 .vscode/
 include/
